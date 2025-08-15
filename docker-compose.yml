@@ -1,0 +1,328 @@
+version: '3.8'
+
+services:
+  # Message Streaming
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: carbon-tracker-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: carbon-tracker-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 4
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # Time Series Database
+  influxdb:
+    image: influxdb:2.7
+    container_name: carbon-tracker-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: carbontracker123
+      DOCKER_INFLUXDB_INIT_ORG: carbon-tracker
+      DOCKER_INFLUXDB_INIT_BUCKET: carbon-emissions
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: carbon-tracker-super-secret-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+
+  # Caching and State Management
+  redis:
+    image: redis:7-alpine
+    container_name: carbon-tracker-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+
+  # Relational Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: carbon-tracker-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: carbon_tracker
+      POSTGRES_USER: carbon_user
+      POSTGRES_PASSWORD: carbon_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # NoSQL Database
+  cassandra:
+    image: cassandra:4.1
+    container_name: carbon-tracker-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: CarbonTrackerCluster
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 200M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+
+  # Stream Processing
+  flink-jobmanager:
+    image: flink:1.17-scala_2.12
+    container_name: carbon-tracker-flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - flink-savepoints:/tmp/flink-savepoints
+
+  flink-taskmanager:
+    image: flink:1.17-scala_2.12
+    container_name: carbon-tracker-flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    scale: 2
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - flink-savepoints:/tmp/flink-savepoints
+
+  # Monitoring and Visualization
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: carbon-tracker-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: carbontracker123
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: carbon-tracker-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+
+  # ML Pipeline
+  mlflow:
+    image: python:3.9-slim
+    container_name: carbon-tracker-mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      bash -c "
+        pip install mlflow psycopg2-binary &&
+        mlflow server 
+        --backend-store-uri postgresql://carbon_user:carbon_password@postgres:5432/carbon_tracker
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+      "
+    depends_on:
+      - postgres
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+
+  # API Gateway
+  nginx:
+    image: nginx:alpine
+    container_name: carbon-tracker-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./config/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - carbon-api
+      - grafana
+
+  # Carbon Tracker API
+  carbon-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: carbon-tracker-api
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: carbon-tracker-super-secret-token
+      INFLUXDB_ORG: carbon-tracker
+      INFLUXDB_BUCKET: carbon-emissions
+      REDIS_URL: redis://redis:6379
+      POSTGRES_URL: postgresql://carbon_user:carbon_password@postgres:5432/carbon_tracker
+      CASSANDRA_HOSTS: cassandra
+    depends_on:
+      - kafka
+      - influxdb
+      - redis
+      - postgres
+      - cassandra
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+
+  # Data Producer
+  carbon-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: carbon-tracker-producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      - kafka
+    volumes:
+      - ./src:/app/src
+
+  # Stream Processor
+  carbon-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.processor
+    container_name: carbon-tracker-processor
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - kafka
+      - redis
+      - flink-jobmanager
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+
+  # ML Training Service
+  carbon-ml-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    container_name: carbon-tracker-ml-trainer
+    environment:
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: carbon-tracker-super-secret-token
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      - influxdb
+      - mlflow
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - mlflow-artifacts:/mlflow/artifacts
+
+  # Elasticsearch for logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: carbon-tracker-elasticsearch
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      xpack.security.enabled: false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+
+  # Kibana for log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: carbon-tracker-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+
+  # Logstash for log processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.8.0
+    container_name: carbon-tracker-logstash
+    volumes:
+      - ./config/logstash/pipeline:/usr/share/logstash/pipeline
+    depends_on:
+      - elasticsearch
+    environment:
+      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  influxdb-data:
+  influxdb-config:
+  redis-data:
+  postgres-data:
+  cassandra-data:
+  flink-checkpoints:
+  flink-savepoints:
+  grafana-data:
+  prometheus-data:
+  mlflow-artifacts:
+  elasticsearch-data:
+
+networks:
+  default:
+    name: carbon-tracker-network
+    driver: bridge
