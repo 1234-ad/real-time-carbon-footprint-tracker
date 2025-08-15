@@ -1,0 +1,40 @@
+apiVersion: 1
+
+datasources:
+  # InfluxDB for time series data
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    database: carbon-emissions
+    user: admin
+    secureJsonData:
+      token: carbon-tracker-super-secret-token
+    jsonData:
+      version: Flux
+      organization: carbon-tracker
+      defaultBucket: carbon-emissions
+      tlsSkipVerify: true
+    isDefault: true
+
+  # Prometheus for metrics
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+
+  # PostgreSQL for relational data
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: carbon_tracker
+    user: carbon_user
+    secureJsonData:
+      password: carbon_password
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 100
+      maxIdleConns: 100
+      connMaxLifetime: 14400
